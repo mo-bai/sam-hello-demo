@@ -8,10 +8,148 @@ Description: >
 # More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
 Globals:
   Function:
-    Timeout: 3
+    Timeout: 60 # 增加到60秒
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-00b010ebfc12f2b09
+    Description: VPC ID for Lambda function
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0fb7c322fa9f27a75
+    Description: First private subnet ID for Lambda function
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-01a79e1e64f273ec5
+    Description: Second private subnet ID for Lambda function
+
+  DBHost:
+    Type: String
+    Default: 'yd-database-prod.ctcceqy4ysgs.ap-southeast-1.rds.amazonaws.com'
+    Description: Database host
+    NoEcho: true
+
+  DBPort:
+    Type: String
+    Default: '5432'
+    Description: Database port
+
+  DBName:
+    Type: String
+    Description: Database name
+    Default: 'yideng'
+
+  DBUser:
+    Type: String
+    Default: 'sanjiang'
+    Description: Database username
+    NoEcho: true
+
+  DBPassword:
+    Type: String
+    Description: Database password
+    NoEcho: true
 
 Resources:
-  HelloWorldFunction:
+  # 为RDS Proxy创建密钥
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-db-credentials'
+      Description: RDS database credentials
+      SecretString: !Sub '{"username":"${DBUser}","password":"${DBPassword}"}'
+
+  # RDS Proxy IAM Role
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSRDSProxyDefaultPolicy
+
+  # RDS Proxy
+  DBProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Sub '${AWS::StackName}-proxy'
+      EngineFamily: POSTGRESQL
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref DBSecret
+          IAMAuth: DISABLED
+      VpcSubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      VpcSecurityGroupIds:
+        - !Ref BlogFunctionSecurityGroup
+      RequireTLS: false
+      IdleClientTimeout: 1800
+
+  # RDS Proxy Target Group
+  DBProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref DBProxy
+      TargetGroupName: default
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 100
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 120
+      DBInstanceIdentifiers:
+        - !Sub '${DBHost}'
+
+  BlogFunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Blog Lambda function
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+  # 数据库心跳检测函数
+  DBHeartbeatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: hello-world/
+      Handler: heartbeat.handler
+      Runtime: nodejs20.x
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          DB_HOST: !Ref DBHost
+          DB_PORT: !Ref DBPort
+          DB_NAME: !Ref DBName
+          DB_USER: !Ref DBUser
+          DB_PASSWORD: !Ref DBPassword
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref BlogFunctionSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Events:
+        HeartbeatSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Keep database connection alive
+            Enabled: true
+
+  BlogFunction:
     Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
     Properties:
       CodeUri: hello-world/
@@ -19,23 +157,121 @@ Resources:
       Runtime: nodejs20.x
       Architectures:
         - x86_64
+      Environment:
+        Variables:
+          DB_PROXY_ENDPOINT: !GetAtt DBProxy.Endpoint
+          DB_HOST: !GetAtt DBProxy.Endpoint
+          DB_PORT: !Ref DBPort
+          DB_NAME: !Ref DBName
+          DB_USER: !Ref DBUser
+          DB_PASSWORD: !Ref DBPassword
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref BlogFunctionSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource:
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/blog-app/db/*'
+        - VPCAccessPolicy: {}
       Events:
+        # 网络诊断接口
+        NetworkDiagnose:
+          Type: Api
+          Properties:
+            Path: /diagnose
+            Method: get
+
+        # 原有的Hello接口
         HelloWorld:
-          Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+          Type: Api
           Properties:
             Path: /hello
             Method: get
+
+        # 创建blogs表
+        CreateBlogTable:
+          Type: Api
+          Properties:
+            Path: /createBlogTable
+            Method: post
+
+        # 创建blog
+        CreateBlog:
+          Type: Api
+          Properties:
+            Path: /createBlog
+            Method: post
+
+        # 获取所有blogs
+        GetBlogs:
+          Type: Api
+          Properties:
+            Path: /blogs
+            Method: get
+
+        # 获取blog详情
+        GetBlogById:
+          Type: Api
+          Properties:
+            Path: /blog/{id}
+            Method: get
+
+        # 删除blog
+        DeleteBlog:
+          Type: Api
+          Properties:
+            Path: /delete/{id}
+            Method: post
+
+        # CORS 预检请求支持
+        OptionsCreateBlogTable:
+          Type: Api
+          Properties:
+            Path: /createBlogTable
+            Method: options
+
+        OptionsCreateBlog:
+          Type: Api
+          Properties:
+            Path: /createBlog
+            Method: options
+
+        OptionsBlogs:
+          Type: Api
+          Properties:
+            Path: /blogs
+            Method: options
+
+        OptionsBlogById:
+          Type: Api
+          Properties:
+            Path: /blog/{id}
+            Method: options
+
+        OptionsDeleteBlog:
+          Type: Api
+          Properties:
+            Path: /delete/{id}
+            Method: options
 
 Outputs:
   # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
   # Find out more about other implicit resources you can reference within SAM
   # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
-  HelloWorldApi:
-    Description: 'API Gateway endpoint URL for Prod stage for Hello World function'
-    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/hello/'
-  HelloWorldFunction:
-    Description: 'Hello World Lambda Function ARN'
-    Value: !GetAtt HelloWorldFunction.Arn
-  HelloWorldFunctionIamRole:
-    Description: 'Implicit IAM Role created for Hello World function'
-    Value: !GetAtt HelloWorldFunctionRole.Arn
+  BlogApi:
+    Description: 'API Gateway endpoint URL for Prod stage for Blog function'
+    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/'
+  BlogFunction:
+    Description: 'Blog Lambda Function ARN'
+    Value: !GetAtt BlogFunction.Arn
+  BlogFunctionIamRole:
+    Description: 'Implicit IAM Role created for Blog function'
+    Value: !GetAtt BlogFunctionRole.Arn

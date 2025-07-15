@@ -89,3 +89,165 @@ sam delete --stack-name sam-hello-demo
 1. 安装 aws cli
 2. 在 IAM 控制台提前创建好用户和用户组，并配置好权限，否则会报错。
 3. 用户创建完成后，配置[访问密钥](https://us-east-1.console.aws.amazon.com/iam/home?region=ap-southeast-1#/users/details/user-sanjiang?section=security_credentials)，使用 aws cli 配置好 aws 的凭证，后续 sam 部署会自动使用。
+
+## 博客 API 功能介绍
+
+本项目已扩展为一个完整的博客管理 API，支持以下功能：
+
+### 功能特性
+
+- ✅ 创建博客数据库表
+- ✅ 新增博客文章
+- ✅ 查询所有博客
+- ✅ 查询博客详情
+- ✅ 删除博客文章
+- ✅ 使用 PostgreSQL 数据库
+- ✅ 通过 AWS SSM 管理数据库连接信息
+- ✅ 支持 CORS 跨域请求
+
+### API 接口列表
+
+| 方法   | 路径               | 功能          | 说明                             |
+| ------ | ------------------ | ------------- | -------------------------------- |
+| POST   | `/createBlogTable` | 创建 blogs 表 | 初次部署时调用                   |
+| POST   | `/createBlog`      | 创建博客      | 需要 title, content, author 参数 |
+| GET    | `/blogs`           | 获取所有博客  | 按创建时间降序排列               |
+| GET    | `/blog/{id}`       | 获取博客详情  | 根据 ID 查询                     |
+| DELETE | `/delete/{id}`     | 删除博客      | 根据 ID 删除                     |
+| GET    | `/hello`           | 测试接口      | 原有的 hello world 接口          |
+
+### 数据库表结构
+
+```sql
+CREATE TABLE blogs (
+  id SERIAL PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  content TEXT NOT NULL,
+  author VARCHAR(100) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### 部署前准备
+
+1. **准备 PostgreSQL 数据库**
+
+   - 可以使用 AWS RDS PostgreSQL 实例
+   - 确保数据库可以从 Lambda 函数访问（VPC 配置）
+
+2. **配置 SSM 参数**
+
+   ```bash
+   # 运行SSM参数配置脚本
+   ./setup-ssm-parameters.sh
+   ```
+
+   脚本会提示你输入以下信息：
+
+   - 数据库主机地址
+   - 数据库端口（默认 5432）
+   - 数据库名称
+   - 数据库用户名
+   - 数据库密码
+
+3. **构建和部署**
+   ```bash
+   sam build
+   sam deploy --guided
+   ```
+
+### 测试 API
+
+部署完成后，使用提供的测试脚本：
+
+```bash
+# 修改test-api.sh中的API_BASE_URL
+# 然后运行测试
+./test-api.sh
+```
+
+或者手动测试：
+
+```bash
+# 设置API地址（从部署输出获取）
+API_URL="https://your-api-id.execute-api.region.amazonaws.com/Prod"
+
+# 1. 创建表
+curl -X POST "$API_URL/createBlogTable"
+
+# 2. 创建博客
+curl -X POST "$API_URL/createBlog" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"测试博客","content":"这是测试内容","author":"测试作者"}'
+
+# 3. 获取所有博客
+curl "$API_URL/blogs"
+
+# 4. 获取博客详情
+curl "$API_URL/blog/{blog-id}"
+
+# 5. 删除博客
+curl -X DELETE "$API_URL/delete/{blog-id}"
+```
+
+### 项目文件说明
+
+- `hello-world/app.mjs` - 主 Lambda 函数，包含所有 API 路由处理
+- `hello-world/db.js` - 数据库连接和查询工具
+- `setup-ssm-parameters.sh` - SSM 参数配置脚本
+- `test-api.sh` - API 测试脚本
+- `template.yaml` - SAM 模板，定义所有 AWS 资源
+
+### 环境变量和权限
+
+应用程序需要以下 AWS 权限：
+
+- `ssm:GetParameter` - 读取 SSM 参数
+- Lambda 执行基本权限
+- VPC 访问权限（如果数据库在 VPC 中）
+
+### 故障排除
+
+1. **数据库连接失败**
+
+   - 检查 SSM 参数是否正确设置
+   - 确认数据库安全组允许 Lambda 访问
+   - 验证 VPC 配置
+
+2. **权限错误**
+
+   - 确认 Lambda 有 SSM 读取权限
+   - 检查 IAM 角色配置
+
+3. **部署失败**
+   - 检查 AWS CLI 配置
+   - 确认有足够的 IAM 权限创建资源
+
+### 生产环境建议
+
+1. **安全性**
+
+   - 使用 VPC 隔离数据库
+   - 启用 RDS 加密
+   - 定期轮换数据库密码
+
+2. **性能优化**
+
+   - 配置适当的 Lambda 内存和超时
+   - 使用连接池管理数据库连接
+   - 考虑使用 RDS Proxy
+
+3. **监控**
+   - 启用 CloudWatch 日志
+   - 设置性能监控和告警
+   - 监控 API Gateway 指标
+
+<!-- 部署命令：传入数据库密码 -->
+
+sam deploy --parameter-overrides DBPassword=您的实际数据库密码
+
+## 问题
+
+1. 冷启动初期，无法正常访问到数据库，需要预热
+2. 隐秘的数据可以通过 ssm 存储，但同样存在连接问题，初期无法访问到；更适合用 lambda 环境变量存储
